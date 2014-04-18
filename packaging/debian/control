@@ -1,0 +1,12 @@
+Source: python-pagerduty
+Section: admin
+Priority: optional
+Maintainer: Duncna Thomas <duncan.thomas@gmail.com>
+Build-Depends: cdbs, debhelper (>= 5.0.0), asciidoc
+Standards-Version: 1.0
+Homepage: http://funcan.github.com/pygerduty
+
+Package: python-pygerduty
+Architecture: all
+Depends: python
+Description: Pager Duty API python bindings

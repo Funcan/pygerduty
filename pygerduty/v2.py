@@ -1,14 +1,16 @@
 import copy
-import datetime
-import functools
-import json
-import time
 import re
-
 import six
-from six import string_types
 from six.moves import urllib
 from .exceptions import Error, IntegrationAPIError, BadRequest, NotFound
+from .common import (
+    Requester,
+    _lower,
+    _upper,
+    _singularize,
+    _pluralize,
+    _json_dumper,
+)
 
 __author__ = "Mike Cugini <cugini@dropbox.com>"
 from .version import __version__, version_info  # noqa
@@ -17,8 +19,6 @@ TRIGGER_LOG_ENTRY_RE = re.compile(
     r'log_entries/(?P<log_entry_id>[A-Z0-9]+)'
 )
 
-ISO8601_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
-
 # TODO:
 # Support for Log Entries
 # Support for Reports
@@ -26,6 +26,7 @@ ISO8601_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 
 class Collection(object):
     paginated = True
+    default_query_params = {}
 
     def __init__(self, pagerduty, base_container=None):
         self.name = getattr(self, "name", False) or _lower(self.__class__.__name__)
@@ -45,15 +46,57 @@ class Collection(object):
 
         data = {self.sname: {}}
 
-        # requester_id needs to be up a level
+        extra_headers = {}
         if "requester_id" in kwargs:
-            data["requester_id"] = kwargs["requester_id"]
-            del kwargs["requester_id"]
-
-        data[self.sname] = kwargs
-
-        response = self.pagerduty.request("POST", path, data=_json_dumper(data))
+            extra_headers["From"] = kwargs.pop("requester_id")
+        new_kwargs = Collection.process_kwargs(kwargs)
+        data[self.sname] = new_kwargs
+        response = self.pagerduty.request("POST", path, data=_json_dumper(data), extra_headers=extra_headers)
         return self.container(self, **response.get(self.sname, {}))
+
+    @staticmethod
+    def process_kwargs(kwargs):
+        new_kwargs = {}
+        for kwarg_key, kwarg_value in kwargs.items():
+            if kwarg_key.endswith('_id'):
+                new_key = Collection.cut_suffix(kwarg_key)
+                new_kwargs[new_key] = Collection.id_to_obj(new_key, kwarg_value)
+            elif kwarg_key.endswith('_ids'):
+                new_key = Collection.cut_suffix(kwarg_key)
+                new_kwargs[_pluralize(new_key)] = Collection.ids_to_objs(new_key, kwarg_value)
+            else:
+                new_kwargs[kwarg_key] = kwarg_value
+        return new_kwargs
+
+    @staticmethod
+    def cut_suffix(key):
+        if key.endswith('_id'):
+            return key[:-3]
+        elif key.endswith('_ids'):
+            return key[:-4]
+        else:
+            return key
+
+    @staticmethod
+    def id_to_obj(key, value):
+        return {
+            "id": value,
+            "type": key
+        }
+
+    @staticmethod
+    def ids_to_objs(key, value):
+        new_kwargs = []
+        for v in value:
+            new_kwarg = Collection.id_to_obj(key, v)
+            new_kwargs.append(new_kwarg)
+        return new_kwargs
+
+    def _apply_default_kwargs(self, kwargs):
+        for k, v in self.default_query_params.items():
+            if k not in kwargs:
+                kwargs[k] = v
+        return kwargs
 
     def update(self, entity_id, **kwargs):
         path = "{0}/{1}".format(self.name, entity_id)
@@ -64,14 +107,14 @@ class Collection(object):
 
         data = {self.sname: {}}
 
-        # requester_id needs to be up a level
+        extra_headers = {}
         if "requester_id" in kwargs:
-            data["requester_id"] = kwargs["requester_id"]
-            del kwargs["requester_id"]
+            extra_headers["From"] = kwargs.pop("requester_id")
 
         data[self.sname] = kwargs
 
-        response = self.pagerduty.request("PUT", path, data=_json_dumper(data))
+        response = self.pagerduty.request("PUT", path, data=_json_dumper(data),
+                                          extra_headers=extra_headers)
         return self.container(self, **response.get(self.sname, {}))
 
     def _list_response(self, response):
@@ -86,20 +129,23 @@ class Collection(object):
             path = "{0}/{1}/{2}".format(
                 self.base_container.collection.name,
                 self.base_container.id, self.name)
-
         suffix_path = kwargs.pop("_suffix_path", None)
+
         if suffix_path is not None:
             path += "/{0}".format(suffix_path)
 
         response = self.pagerduty.request("GET", path, query_params=kwargs)
+
         return self._list_response(response)
 
     def list(self, **kwargs):
+        kwargs = self._apply_default_kwargs(kwargs)
         # Some APIs are paginated. If they are, and the user isn't doing
         # pagination themselves, let's do it for them
         if not self.paginated or any(key in kwargs for key in ('offset', 'limit')):
             for i in self._list_no_pagination(**kwargs):
                 yield i
+
         else:
             offset = 0
             limit = self.pagerduty.page_size
@@ -111,13 +157,16 @@ class Collection(object):
                     'offset': offset,
                 })
                 this_paginated_result = self._list_no_pagination(**these_kwargs)
+
                 if not this_paginated_result:
                     break
+
                 for item in this_paginated_result:
                     if item.id in seen_items:
                         continue
                     seen_items.add(item.id)
                     yield item
+
                 offset += len(this_paginated_result)
                 if len(this_paginated_result) > limit:
                     # sometimes pagerduty decides to ignore your limit and
@@ -131,14 +180,15 @@ class Collection(object):
         return response.get("total", None)
 
     def show(self, entity_id, **kwargs):
+        kwargs = self._apply_default_kwargs(kwargs)
         path = "{0}/{1}".format(self.name, entity_id)
         if self.base_container:
             path = "{0}/{1}/{2}/{3}".format(
                 self.base_container.collection.name,
                 self.base_container.id, self.name, entity_id)
-
         response = self.pagerduty.request(
             "GET", path, query_params=kwargs)
+
         if response.get(self.sname):
             return self.container(self, **response.get(self.sname, {}))
         else:
@@ -175,21 +225,24 @@ class MaintenanceWindows(Collection):
 class Incidents(Collection):
     def update(self, requester_id, *args):
         path = "{0}".format(self.name)
-        data = {"requester_id": requester_id, self.name: args}
-        response = self.pagerduty.request("PUT", path, data=_json_dumper(data))
+        extra_headers = {"From": requester_id}
+        data = {self.name: args}
+        response = self.pagerduty.request("PUT", path, data=_json_dumper(data), extra_headers=extra_headers)
         return self.container(self, **response.get(self.sname, {}))
 
 
 class Services(Collection):
     def disable(self, entity_id, requester_id):
-        path = "{0}/{1}/disable".format(self.name, entity_id)
-        data = {"requester_id": requester_id}
-        response = self.pagerduty.request("PUT", path, data=_json_dumper(data))
+        path = "{0}/{1}".format(self.name, entity_id)
+        extra_headers = {"From": requester_id}
+        data = {"service": {"status": "disabled"}}
+        response = self.pagerduty.request("PUT", path, data=_json_dumper(data), extra_headers=extra_headers)
         return response
 
     def enable(self, entity_id):
-        path = "{0}/{1}/enable".format(self.name, entity_id)
-        response = self.pagerduty.request("PUT", path, data="")
+        path = "{0}/{1}".format(self.name, entity_id)
+        data = {"service": {"status": "active"}}
+        response = self.pagerduty.request("PUT", path, data=_json_dumper(data))
         return response
 
     def regenerate_key(self, entity_id):
@@ -210,13 +263,8 @@ class Overrides(Collection):
     paginated = False
 
 
-class Entries(Collection):
-    paginated = False
-
-
 class EscalationPolicies(Collection):
-    def on_call(self, **kwargs):
-        return self.list(_suffix_path="on_call", **kwargs)
+    pass
 
 
 class EscalationRules(Collection):
@@ -240,13 +288,15 @@ class Schedules(Collection):
 
 
 class ScheduleUsers(Collection):
+    """This class exists because Users returned from a Schedule query are not
+    paginated, whereas responses for Users class are. This causes a pagination
+    bug if removed."""
     name = 'users'
     paginated = False
 
 
 class Users(Collection):
-    def on_call(self, **kwargs):
-        return self.list(_suffix_path="on_call", **kwargs)
+    pass
 
 
 class Restrictions(Collection):
@@ -265,8 +315,21 @@ class EmailFilters(Collection):
     pass
 
 
-class LogEntries(Collection):
+class Extensions(Collection):
     pass
+
+
+class Addons(Collection):
+    pass
+
+
+class Oncalls(Collection):
+    pass
+
+
+class LogEntries(Collection):
+    # https://support.pagerduty.com/v1/docs/retrieve-trigger-event-data-using-the-api#section-how-to-obtain-the-data  # noqa
+    default_query_params = {'include': ['channels']}
 
 
 class Notes(Collection):
@@ -360,42 +423,102 @@ class Container(object):
         return json_dict
 
 
+class Extension(Container):
+    pass
+
+
+class Addon(Container):
+    def install(self, *args, **kwargs):
+        raise NotImplementedError()
+
+    def delete(self, *args, **kwargs):
+        raise NotImplementedError()
+
+    def list(self, *args, **kwargs):
+        raise NotImplementedError()
+
+
+class Oncall(Container):
+    def __init__(self, *args, **kwargs):
+        Container.__init__(self, *args, **kwargs)
+        self.id = '%s:%s:%s' % (self.user.id if hasattr(self, 'user') and self.user else '',
+                                self.schedule.id if hasattr(
+                                    self, 'schedule') and self.schedule else '',
+                                self.escalation_policy.id if hasattr(
+                                    self, 'escalation_policy') and self.escalation_policy else '')
+
+
 class Incident(Container):
     def __init__(self, *args, **kwargs):
         Container.__init__(self, *args, **kwargs)
         self.log_entries = LogEntries(self.pagerduty, self)
         self.notes = Notes(self.pagerduty, self)
 
-    def _do_action(self, verb, requester_id, **kwargs):
-        path = '{0}/{1}/{2}'.format(self.collection.name, self.id, verb)
-        data = {'requester_id': requester_id}
-        data.update(kwargs)
-        return self.pagerduty.request('PUT', path, data=_json_dumper(data))
+    def _do_action(self, verb, requester, **kwargs):
+        path = '{0}/{1}'.format(self.collection.name, self.id)
+        data = {
+            "incident": {
+                "type": "incident_reference",
+                "status": verb
+            }
+        }
+        extra_headers = {'From': requester}
+        return self.pagerduty.request('PUT', path, data=_json_dumper(data), extra_headers=extra_headers)
 
-    def has_subject(self):
-        return hasattr(self.trigger_summary_data, 'subject')
+    def resolve(self, requester):
+        """Resolve this incident.
+        :param requester: The email address of the individual acknowledging.
+        """
+        self._do_action('resolved', requester=requester)
 
-    def resolve(self, requester_id):
-        self._do_action('resolve', requester_id=requester_id)
+    def acknowledge(self, requester):
+        """Acknowledge this incident.
+        :param requester: The email address of the individual acknowledging.
+        """
+        self._do_action('acknowledged', requester=requester)
 
-    def acknowledge(self, requester_id):
-        self._do_action('acknowledge', requester_id=requester_id)
-
-    def snooze(self, requester_id, duration):
-        self._do_action('snooze', requester_id=requester_id, duration=duration)
+    def snooze(self, requester, duration):
+        """Snooze incident.
+        :param requester: The email address of the individual requesting snooze.
+        """
+        path = '{0}/{1}/{2}'.format(self.collection.name, self.id, 'snooze')
+        data = {"duration": duration}
+        extra_headers = {"From": requester}
+        return self.pagerduty.request('POST', path, data=_json_dumper(data), extra_headers=extra_headers)
 
     def get_trigger_log_entry(self, **kwargs):
         match = TRIGGER_LOG_ENTRY_RE.search(self.trigger_details_html_url)
         return self.log_entries.show(match.group('log_entry_id'), **kwargs)
 
-    def reassign(self, user_ids, requester_id):
+    def reassign(self, user_ids, requester):
         """Reassign this incident to a user or list of users
 
         :param user_ids: A non-empty list of user ids
+        :param requester: The email address of individual requesting reassign
         """
+        path = '{0}'.format(self.collection.name)
+        assignments = []
         if not user_ids:
             raise Error('Must pass at least one user id')
-        self._do_action('reassign', requester_id=requester_id, assigned_to_user=','.join(user_ids))
+        for user_id in user_ids:
+            ref = {
+                "assignee": {
+                    "id": user_id,
+                    "type": "user_reference"
+                }
+            }
+            assignments.append(ref)
+        data = {
+            "incidents": [
+                {
+                    "id": self.id,
+                    "type": "incident_reference",
+                    "assignments": assignments
+                }
+            ]
+        }
+        extra_headers = {"From": requester}
+        return self.pagerduty.request('PUT', path, data=_json_dumper(data), extra_headers=extra_headers)
 
 
 class Note(Container):
@@ -459,7 +582,6 @@ class Schedule(Container):
         Container.__init__(self, *args, **kwargs)
         self.overrides = Overrides(self.pagerduty, self)
         self.users = ScheduleUsers(self.pagerduty, self)
-        self.entries = Entries(self.pagerduty, self)
 
 
 class ScheduleUser(Container):
@@ -492,30 +614,24 @@ class LogEntry(Container):
     pass
 
 
+class FinalSchedule(Container):
+    pass
+
+
+class RenderSchedule(Container):
+    pass
+
+
 class PagerDuty(object):
-
-    INTEGRATION_API_URL =\
-        "https://events.pagerduty.com/generic/2010-04-15/create_event.json"
-
-    def __init__(self, subdomain, api_token, timeout=10, max_403_retries=0,
-                 page_size=25, proxies=None, parse_datetime=False):
+    def __init__(self, api_token, timeout=10, page_size=25,
+                 proxies=None, parse_datetime=False):
 
         self.api_token = api_token
-        self.subdomain = subdomain
-        self._host = "{0}.pagerduty.com".format(subdomain)
-        self._api_base = "https://{0}/api/v1/".format(self._host)
+        self._host = "api.pagerduty.com"
+        self._api_base = "https://{0}/".format(self._host)
         self.timeout = timeout
-        self.max_403_retries = max_403_retries
         self.page_size = page_size
-
-        self.json_loader = json.loads
-        if parse_datetime:
-            self.json_loader = _json_loader
-
-        handlers = []
-        if proxies:
-            handlers.append(urllib.request.ProxyHandler(proxies))
-        self.opener = urllib.request.build_opener(*handlers)
+        self.requester = Requester(timeout=timeout, proxies=proxies, parse_datetime=parse_datetime)
 
         # Collections
         self.incidents = Incidents(self)
@@ -527,98 +643,9 @@ class PagerDuty(object):
         self.maintenance_windows = MaintenanceWindows(self)
         self.teams = Teams(self)
         self.log_entries = LogEntries(self)
-
-    def create_event(self, service_key, description, event_type,
-                     details, incident_key, **kwargs):
-
-        # Only assign client/client_url/contexts if they exist, only for trigger_incident
-        client = kwargs.pop('client', None)
-        client_url = kwargs.pop('client_url', None)
-        contexts = kwargs.pop('contexts', None)
-
-        headers = {
-            "Content-type": "application/json",
-        }
-
-        data = {
-            "service_key": service_key,
-            "event_type": event_type,
-            "description": description,
-            "details": details,
-            "incident_key": incident_key,
-            "client": client,
-            "client_url": client_url,
-            "contexts": contexts,
-        }
-
-        request = urllib.request.Request(PagerDuty.INTEGRATION_API_URL,
-                                         data=_json_dumper(data).encode('utf-8'),
-                                         headers=headers)
-        response = self.execute_request(request)
-
-        if not response["status"] == "success":
-            raise IntegrationAPIError(response["message"], event_type)
-        return response["incident_key"]
-
-    def resolve_incident(self, service_key, incident_key,
-                         description=None, details=None):
-        """ Causes the referenced incident to enter resolved state.
-        Send a resolve event when the problem that caused the initial
-        trigger has been fixed.
-        """
-
-        return self.create_event(service_key, description, "resolve",
-                                 details, incident_key)
-
-    def acknowledge_incident(self, service_key, incident_key,
-                             description=None, details=None):
-        """ Causes the referenced incident to enter the acknowledged state.
-        Send an acknowledge event when someone is presently working on the
-        incident.
-        """
-
-        return self.create_event(service_key, description, "acknowledge",
-                                 details, incident_key)
-
-    def trigger_incident(self, service_key, description,
-                         incident_key=None, details=None,
-                         client=None, client_url=None, contexts=None):
-        """ Report a new or ongoing problem. When PagerDuty receives a trigger,
-        it will either open a new incident, or add a new log entry to an
-        existing incident.
-        """
-
-        return self.create_event(service_key, description, "trigger",
-                                 details, incident_key,
-                                 client=client, client_url=client_url, contexts=contexts)
-
-    def execute_request(self, request, retry_count=0):
-        try:
-            response = (self.opener.open(request, timeout=self.timeout).
-                        read().decode("utf-8"))
-        except urllib.error.HTTPError as err:
-            if err.code / 100 == 2:
-                response = err.read().decode("utf-8")
-            elif err.code == 400:
-                raise BadRequest(self.json_loader(err.read().decode("utf-8")))
-            elif err.code == 403:
-                if retry_count < self.max_403_retries:
-                    time.sleep(1 * (retry_count + 1))
-                    return self.execute_request(request, retry_count + 1)
-                else:
-                    raise
-            elif err.code == 404:
-                raise NotFound("URL ({0}) Not Found.".format(
-                    request.get_full_url()))
-            else:
-                raise
-
-        try:
-            response = self.json_loader(response)
-        except ValueError:
-            response = None
-
-        return response
+        self.extensions = Extensions(self)
+        self.addons = Addons(self)
+        self.oncalls = Oncalls(self)
 
     @staticmethod
     def _process_query_params(query_params):
@@ -637,6 +664,7 @@ class PagerDuty(object):
 
         auth = "Token token={0}".format(self.api_token)
         headers = {
+            "Accept": "application/vnd.pagerduty+json;version=2",
             "Content-type": "application/json",
             "Authorization": auth
         }
@@ -658,72 +686,4 @@ class PagerDuty(object):
         request = urllib.request.Request(url, data=data, headers=headers)
         request.get_method = lambda: method.upper()
 
-        return self.execute_request(request)
-
-
-def _lower(string):
-    """Custom lower string function.
-
-    Examples:
-        FooBar -> foo_bar
-    """
-    if not string:
-        return ""
-
-    new_string = [string[0].lower()]
-    for char in string[1:]:
-        if char.isupper():
-            new_string.append("_")
-        new_string.append(char.lower())
-
-    return "".join(new_string)
-
-
-def _upper(string):
-    """Custom upper string function.
-
-    Examples:
-        foo_bar -> FooBar
-    """
-    return string.title().replace("_", "")
-
-
-def _singularize(string):
-    """Hacky singularization function."""
-
-    if string.endswith("ies"):
-        return string[:-3] + "y"
-    if string.endswith("s"):
-        return string[:-1]
-    return string
-
-
-def _pluralize(string):
-    """Hacky pluralization function."""
-
-    if string.endswith("y"):
-        return string[:-1] + "ies"
-    if not string.endswith("s"):
-        return string + "s"
-    return string
-
-
-class _DatetimeEncoder(json.JSONEncoder):
-    def default(self, obj):
-        if isinstance(obj, (datetime.date, datetime.datetime)):
-            return obj.strftime(ISO8601_FORMAT)
-        super(_DatetimeEncoder, self).default(obj)
-
-
-def _datetime_decoder(obj):
-    for k, v in obj.items():
-        if isinstance(v, string_types):
-            try:
-                obj[k] = datetime.datetime.strptime(v, ISO8601_FORMAT)
-            except ValueError:
-                pass
-    return obj
-
-
-_json_dumper = functools.partial(json.dumps, cls=_DatetimeEncoder)
-_json_loader = functools.partial(json.loads, object_hook=_datetime_decoder)
+        return self.requester.execute_request(request)
